@@ -1,0 +1,312 @@
+// Airtable script to assign EntryIDs to routine entries
+
+let table = base.getTable("San Fran 26"); // Change to the correct table name
+let query = await table.selectRecordsAsync({
+    fields: [
+        "Participant",
+        "Age",
+        "Sex",
+        "RoutineType",
+        "AgeDivision",
+        "StudioName",
+        "Date of Birth",   // single line text: "12/26/2016" or "(12/26/2016)"
+        "DCG ID"           // used to order multiple routines per participant
+    ]
+});
+
+// ---------- Helpers ----------
+const divisionOrder = { "Primary": 0, "Junior": 1, "Senior": 2 };
+
+function participantsCountFromField(rec) {
+    const p = rec.getCellValue("Participant");
+    if (!p) return 0;
+    return p.split(",").map(s => s.trim()).filter(Boolean).length || 0;
+}
+function isSolo(rec) {
+    return participantsCountFromField(rec) === 1;
+}
+function parseDOBTextToDate(rec) {
+    const raw = rec.getCellValue("Date of Birth");
+    if (!raw) return null;
+    const s = String(raw).replace(/[()]/g, "").trim(); // strip () if present
+    const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (!m) return null;
+    const mm = parseInt(m[1], 10), dd = parseInt(m[2], 10), yyyy = parseInt(m[3], 10);
+    const d = new Date(yyyy, mm - 1, dd);
+    return isNaN(d.getTime()) ? null : d;
+}
+function dobTimestamp(rec) {
+    const d = parseDOBTextToDate(rec);
+    return d ? d.getTime() : null;
+}
+function dcgValue(rec) {
+    const v = rec.getCellValue("DCG ID");
+    if (typeof v === "number") return v;
+    const n = parseInt(v, 10);
+    return isNaN(n) ? Number.POSITIVE_INFINITY : n;
+}
+
+// Sort overall:
+// - AgeDivision: Primary -> Junior -> Senior
+// - For solos only: DOB (youngest -> oldest = later DOB first)
+// - For non-solos: Age ascending
+// - Females before Males; stable tie-break on participant name
+function sortRecords(records) {
+    const sexOrder = { "Female": 0, "Male": 1, "N/A": 2 };
+    return records.sort((a, b) => {
+        const divA = divisionOrder[a.getCellValue("AgeDivision")] ?? 999;
+        const divB = divisionOrder[b.getCellValue("AgeDivision")] ?? 999;
+        if (divA !== divB) return divA - divB;
+
+        const aSolo = isSolo(a);
+        const bSolo = isSolo(b);
+
+        if (aSolo && bSolo) {
+            const ta = dobTimestamp(a);
+            const tb = dobTimestamp(b);
+            if (ta !== tb) {
+                const aa = (ta === null) ? -Infinity : ta; // missing DOB = oldest
+                const bb = (tb === null) ? -Infinity : tb;
+                return bb - aa; // DESC
+            }
+        } else if (!aSolo && !bSolo) {
+            const ageA = a.getCellValue("Age") ?? Infinity;
+            const ageB = b.getCellValue("Age") ?? Infinity;
+            if (ageA !== ageB) return ageA - ageB;
+        } else {
+            if (aSolo !== bSolo) return aSolo ? -1 : 1;
+        }
+
+        const sa = sexOrder[a.getCellValue("Sex") || "N/A"];
+        const sb = sexOrder[b.getCellValue("Sex") || "N/A"];
+        if (sa !== sb) return sa - sb;
+
+        const pa = (a.getCellValue("Participant") || "").toLowerCase();
+        const pb = (b.getCellValue("Participant") || "").toLowerCase();
+        return pa.localeCompare(pb);
+    });
+}
+
+// Preserve participant order from the sorted list,
+// but within each participant group, sort by DCG ID ASC
+function groupSortByParticipantDCG(records) {
+    const groups = new Map();
+    const order = [];
+    for (const r of records) {
+        const p = r.getCellValue("Participant") || "";
+        if (!groups.has(p)) {
+            groups.set(p, []);
+            order.push(p);
+        }
+        groups.get(p).push(r);
+    }
+    for (const p of order) {
+        groups.get(p).sort((a, b) => dcgValue(a) - dcgValue(b));
+    }
+    const out = [];
+    for (const p of order) out.push(...groups.get(p));
+    return out;
+}
+
+// ---------- Main ----------
+let baseEntryId = 1001; // Change to starting number for Primary at that city
+let lastAssignedId = baseEntryId - 1;
+let assignedEntryIds = new Set();
+let updates = [];
+let participantRoutineCount = new Map();
+
+let allRecords = query.records.filter(
+    record => record.getCellValue("RoutineType") !== "N/A"
+);
+
+// Global ordering (incl. DOB for solos)
+let sortedRecords = sortRecords(allRecords);
+let ageDivisions = ["Primary", "Junior", "Senior"];
+
+for (let division of ageDivisions) {
+    let divisionRecords = sortedRecords.filter(r => r.getCellValue("AgeDivision") === division);
+
+    // Solo buckets only (ensembles handled later)
+    let femaleClassical = groupSortByParticipantDCG(
+        divisionRecords.filter(r =>
+            r.getCellValue("RoutineType") === "Classical" &&
+            r.getCellValue("Sex") === "Female" &&
+            isSolo(r)
+        )
+    );
+    let femaleContemporary = groupSortByParticipantDCG(
+        divisionRecords.filter(r =>
+            r.getCellValue("RoutineType") === "Contemporary" &&
+            r.getCellValue("Sex") === "Female" &&
+            isSolo(r)
+        )
+    );
+    let maleClassical = groupSortByParticipantDCG(
+        divisionRecords.filter(r =>
+            r.getCellValue("RoutineType") === "Classical" &&
+            r.getCellValue("Sex") === "Male" &&
+            isSolo(r)
+        )
+    );
+    let maleContemporary = groupSortByParticipantDCG(
+        divisionRecords.filter(r =>
+            r.getCellValue("RoutineType") === "Contemporary" &&
+            r.getCellValue("Sex") === "Male" &&
+            isSolo(r)
+        )
+    );
+
+    // ---- FEMALE / CLASSICAL ----
+    for (let record of femaleClassical) {
+        const participant = record.getCellValue("Participant");
+        if (!participantRoutineCount.has(participant)) {
+            participantRoutineCount.set(participant, { EntryID: null, Classical: 0, Contemporary: 0 });
+        }
+        const routineCounts = participantRoutineCount.get(participant);
+        if (routineCounts.EntryID === null) {
+            lastAssignedId++;
+            routineCounts.EntryID = lastAssignedId;
+        }
+        routineCounts.Classical++;
+        const suffix = routineCounts.Classical > 1 ? `.${routineCounts.Classical}` : "";
+        updates.push({ id: record.id, fields: { EntryID: `${routineCounts.EntryID}${suffix}` } });
+    }
+
+    // ---- FEMALE / CONTEMPORARY ----
+    for (let record of femaleContemporary) {
+        const participant = record.getCellValue("Participant");
+        if (!participantRoutineCount.has(participant)) {
+            participantRoutineCount.set(participant, { EntryID: null, Classical: 0, Contemporary: 0 });
+        }
+        const routineCounts = participantRoutineCount.get(participant);
+        let entryId = routineCounts.EntryID || null;
+        let suffix = "";
+
+        if (routineCounts.Classical > 0) {
+            // has classical -> 'c', '.2c', '.3c' ...
+            routineCounts.Contemporary++;
+            suffix = routineCounts.Contemporary > 1 ? `.${routineCounts.Contemporary}c` : "c";
+        } else {
+            // NO classical -> same base ID across all contemporary routines, 'xc', '.2xc', '.3xc' ...
+            if (entryId === null) {
+                lastAssignedId++;
+                entryId = lastAssignedId;
+                routineCounts.EntryID = entryId;
+            }
+            routineCounts.Contemporary++;
+            suffix = routineCounts.Contemporary > 1 ? `.${routineCounts.Contemporary}xc` : "xc";
+        }
+
+        updates.push({ id: record.id, fields: { EntryID: `${routineCounts.EntryID}${suffix}` } });
+    }
+
+    // ---- MALE / CLASSICAL ----
+    for (let record of maleClassical) {
+        const participant = record.getCellValue("Participant");
+        if (!participantRoutineCount.has(participant)) {
+            participantRoutineCount.set(participant, { EntryID: null, Classical: 0, Contemporary: 0 });
+        }
+        const routineCounts = participantRoutineCount.get(participant);
+        if (routineCounts.EntryID === null) {
+            lastAssignedId++;
+            routineCounts.EntryID = lastAssignedId;
+        }
+        routineCounts.Classical++;
+        const suffix = routineCounts.Classical > 1 ? `.${routineCounts.Classical}` : "";
+        updates.push({ id: record.id, fields: { EntryID: `${routineCounts.EntryID}${suffix}` } });
+    }
+
+    // ---- MALE / CONTEMPORARY ----
+    for (let record of maleContemporary) {
+        const participant = record.getCellValue("Participant");
+        if (!participantRoutineCount.has(participant)) {
+            participantRoutineCount.set(participant, { EntryID: null, Classical: 0, Contemporary: 0 });
+        }
+        const routineCounts = participantRoutineCount.get(participant);
+        let entryId = routineCounts.EntryID || null;
+        let suffix = "";
+
+        if (routineCounts.Classical > 0) {
+            // has classical -> 'c', '.2c', '.3c' ...
+            routineCounts.Contemporary++;
+            suffix = routineCounts.Contemporary > 1 ? `.${routineCounts.Contemporary}c` : "c";
+        } else {
+            // NO classical -> same base ID across all contemporary routines, 'xc', '.2xc', '.3xc' ...
+            if (entryId === null) {
+                lastAssignedId++;
+                entryId = lastAssignedId;
+                routineCounts.EntryID = entryId;
+            }
+            routineCounts.Contemporary++;
+            suffix = routineCounts.Contemporary > 1 ? `.${routineCounts.Contemporary}xc` : "xc";
+        }
+
+        updates.push({ id: record.id, fields: { EntryID: `${routineCounts.EntryID}${suffix}` } });
+    }
+
+    // ----- GAP: skip 5 integers after finishing MALES for this division -----
+    lastAssignedId += 5;
+}
+
+// Perform batched updates for solos
+while (updates.length > 0) {
+    await table.updateRecordsAsync(updates.splice(0, 50));
+}
+
+// ---------- Duos / Trios (Pas/Duo/Trio) then Ensembles ----------
+// NOTE: Removed the extra "lastAssignedId += 5" here to avoid a double gap after Senior.
+
+let duoTrioRecords = query.records.filter(
+    record => record.getCellValue("RoutineType") === "Pas/Duo/Trio"
+);
+let ensembleRecords = query.records.filter(
+    record => record.getCellValue("RoutineType") === "Ensemble"
+);
+
+// We'll reuse your existing "avoid immediate repeats" logic.
+let assignedParticipants = []; // Track last assigned participants
+
+function assignEntryIDs(list) {
+    for (let record of list) {
+        let participants = (record.getCellValue("Participant") || "").split(",").map(p => p.trim()).filter(Boolean);
+        let initialID = lastAssignedId + 1;
+        let maxRetries = 5;
+        let assigned = false;
+
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            // Avoid immediate participant repeat (one routine between repeats)
+            if (!participants.some(p => assignedParticipants.slice(-1).includes(p))) {
+                lastAssignedId = initialID;
+                updates.push({ id: record.id, fields: { EntryID: `${lastAssignedId}` } });
+
+                assignedParticipants.push(...participants);
+                if (assignedParticipants.length > 1) {
+                    assignedParticipants.splice(0, assignedParticipants.length - 1); // keep last 1
+                }
+
+                assigned = true;
+                break;
+            }
+            initialID++;
+        }
+
+        if (!assigned) {
+            lastAssignedId = initialID; // failsafe
+            updates.push({ id: record.id, fields: { EntryID: `${lastAssignedId}` } });
+        }
+    }
+}
+
+// Assign Pas/Duo/Trio first
+assignEntryIDs(duoTrioRecords);
+
+// ----- GAP: skip 5 integers before starting Ensembles -----
+lastAssignedId += 5;
+
+// Then assign Ensembles
+assignEntryIDs(ensembleRecords);
+
+// Perform batched updates for P/D/T and Ensembles
+while (updates.length > 0) {
+    await table.updateRecordsAsync(updates.splice(0, 50));
+}
