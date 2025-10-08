@@ -1,0 +1,195 @@
+// Airtable script to assign EntryIDs to routine entries
+
+let table = base.getTable("Toronto"); // Change to the correct table name
+let query = await table.selectRecordsAsync({
+    fields: ["Participant", "Age", "Sex", "RoutineType", "AgeDivision", "StudioName"]
+});
+
+function sortRecords(records) {
+    return records.sort((a, b) => {
+        let ageDivisionA = a.getCellValue("AgeDivision") || "";
+        let ageDivisionB = b.getCellValue("AgeDivision") || "";
+        if (ageDivisionA !== ageDivisionB) return ageDivisionA.localeCompare(ageDivisionB);
+        
+        let ageA = a.getCellValue("Age") || Infinity;
+        let ageB = b.getCellValue("Age") || Infinity;
+        if (ageA !== ageB) return ageA - ageB;
+        
+        let sexOrder = { "Female": 0, "Male": 1, "N/A": 2 };
+        let sexA = sexOrder[a.getCellValue("Sex") || "N/A"];
+        let sexB = sexOrder[b.getCellValue("Sex") || "N/A"];
+        if (sexA !== sexB) return sexA - sexB;
+        
+        let participantA = (a.getCellValue("Participant") || "").toLowerCase();
+        let participantB = (b.getCellValue("Participant") || "").toLowerCase();
+        return participantA.localeCompare(participantB);
+    });
+}
+
+let baseEntryId = 1001; // Starting for Primary
+let lastAssignedId = baseEntryId - 1;
+let assignedEntryIds = new Set();
+let updates = [];
+let participantRoutineCount = new Map();
+
+let allRecords = query.records.filter(
+    record => record.getCellValue("RoutineType") !== "N/A"
+);
+
+let sortedRecords = sortRecords(allRecords);
+let ageDivisions = ["Primary", "Junior", "Senior"];
+
+for (let division of ageDivisions) {
+    let divisionRecords = sortedRecords.filter(r => r.getCellValue("AgeDivision") === division);
+    let femaleClassical = divisionRecords.filter(r => r.getCellValue("RoutineType") === "Classical" && r.getCellValue("Sex") === "Female");
+    let femaleContemporary = divisionRecords.filter(r => r.getCellValue("RoutineType") === "Contemporary" && r.getCellValue("Sex") === "Female");
+    let maleClassical = divisionRecords.filter(r => r.getCellValue("RoutineType") === "Classical" && r.getCellValue("Sex") === "Male");
+    let maleContemporary = divisionRecords.filter(r => r.getCellValue("RoutineType") === "Contemporary" && r.getCellValue("Sex") === "Male");
+    
+    // Assign Classical Entry IDs First for Females
+    for (let record of femaleClassical) {
+        let participant = record.getCellValue("Participant");
+        if (!participantRoutineCount.has(participant)) {
+            participantRoutineCount.set(participant, { EntryID: null, Classical: 0, Contemporary: 0 });
+        }
+        let routineCounts = participantRoutineCount.get(participant);
+        if (routineCounts.EntryID === null) {
+            lastAssignedId++;
+            routineCounts.EntryID = lastAssignedId;
+        }
+        routineCounts.Classical++;
+        let suffix = routineCounts.Classical > 1 ? `.${routineCounts.Classical}` : "";
+        updates.push({ id: record.id, fields: { EntryID: `${routineCounts.EntryID}${suffix}` } });
+    }
+
+    // Assign Contemporary Entry IDs for Females
+    for (let record of femaleContemporary) {
+        let participant = record.getCellValue("Participant");
+        if (!participantRoutineCount.has(participant)) {
+            participantRoutineCount.set(participant, { EntryID: null, Classical: 0, Contemporary: 0 });
+        }
+        let routineCounts = participantRoutineCount.get(participant);
+        let entryId = routineCounts.EntryID || null;
+        let suffix = "";
+        
+        if (routineCounts.Classical > 0) {
+            routineCounts.Contemporary++;
+            suffix = routineCounts.Contemporary > 1 ? `.${routineCounts.Contemporary}c` : "c";
+        } else {
+            lastAssignedId++;
+            entryId = lastAssignedId;
+            routineCounts.EntryID = entryId;
+            routineCounts.Contemporary++;
+            suffix = routineCounts.Contemporary > 1 ? `.${routineCounts.Contemporary}xc` : "xc";
+        }
+        
+        updates.push({ id: record.id, fields: { EntryID: `${entryId}${suffix}` } });
+    }
+
+    // Assign Classical Entry IDs for Males
+    for (let record of maleClassical) {
+        let participant = record.getCellValue("Participant");
+        if (!participantRoutineCount.has(participant)) {
+            participantRoutineCount.set(participant, { EntryID: null, Classical: 0, Contemporary: 0 });
+        }
+        let routineCounts = participantRoutineCount.get(participant);
+        if (routineCounts.EntryID === null) {
+            lastAssignedId++;
+            routineCounts.EntryID = lastAssignedId;
+        }
+        routineCounts.Classical++;
+        let suffix = routineCounts.Classical > 1 ? `.${routineCounts.Classical}` : "";
+        updates.push({ id: record.id, fields: { EntryID: `${routineCounts.EntryID}${suffix}` } });
+    }
+
+    // Assign Contemporary Entry IDs for Males
+    for (let record of maleContemporary) {
+        let participant = record.getCellValue("Participant");
+        if (!participantRoutineCount.has(participant)) {
+            participantRoutineCount.set(participant, { EntryID: null, Classical: 0, Contemporary: 0 });
+        }
+        let routineCounts = participantRoutineCount.get(participant);
+        let entryId = routineCounts.EntryID || null;
+        let suffix = "";
+        
+        if (routineCounts.Classical > 0) {
+            routineCounts.Contemporary++;
+            suffix = routineCounts.Contemporary > 1 ? `.${routineCounts.Contemporary}c` : "c";
+        } else {
+            lastAssignedId++;
+            entryId = lastAssignedId;
+            routineCounts.EntryID = entryId;
+            routineCounts.Contemporary++;
+            suffix = routineCounts.Contemporary > 1 ? `.${routineCounts.Contemporary}xc` : "xc";
+        }
+        
+        updates.push({ id: record.id, fields: { EntryID: `${entryId}${suffix}` } });
+    }
+}
+
+// Perform batched updates
+while (updates.length > 0) {
+    await table.updateRecordsAsync(updates.splice(0, 50));
+}
+// Assign EntryIDs for Ensembles
+let ensembleRecords = query.records.filter(
+    record => record.getCellValue("RoutineType") === "Ensemble" || record.getCellValue("RoutineType") === "Pas/Duo/Trio"
+);
+
+// Separate small ensembles (2-3 dancers) from large ensembles (4+ dancers)
+let smallEnsembles = [];
+let largeEnsembles = [];
+
+ensembleRecords.forEach(record => {
+    let participants = (record.getCellValue("Participant") || "").split(",").map(p => p.trim());
+    if (participants.length <= 3) {
+        smallEnsembles.push({ record, participants });
+    } else {
+        largeEnsembles.push({ record, participants });
+    }
+});
+
+let assignedParticipants = []; // Track last assigned participants
+
+function assignEntryIDs(ensembleList) {
+    for (let { record, participants } of ensembleList) {
+        let initialID = lastAssignedId + 1;
+        let maxRetries = 5;
+        let assigned = false;
+
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            // Ensure the ID is sequential and avoids immediate repeats (only one routine between repeats)
+            if (!participants.some(p => assignedParticipants.slice(-1).includes(p))) {
+                lastAssignedId = initialID; // Use the next available ID
+                updates.push({ id: record.id, fields: { EntryID: `${lastAssignedId}` } });
+                assignedEntryIds.add(lastAssignedId);
+
+                // Track assigned participants to avoid immediate repetition
+                assignedParticipants.push(...participants);
+                if (assignedParticipants.length > 1) {
+                    assignedParticipants.splice(0, assignedParticipants.length - 1); // Keep last 1 assignment
+                }
+
+                assigned = true;
+                break; // Stop retrying since we've assigned the ID
+            }
+            initialID++; // Increment and try again if conflict detected
+        }
+
+        // **Failsafe**: If it couldn't avoid repetition, force an assignment to avoid infinite loops
+        if (!assigned) {
+            lastAssignedId = initialID; // Assign anyway even if not ideal
+            updates.push({ id: record.id, fields: { EntryID: `${lastAssignedId}` } });
+            assignedEntryIds.add(lastAssignedId);
+        }
+    }
+}
+
+// Assign small ensembles first, then large ensembles
+assignEntryIDs(smallEnsembles);
+assignEntryIDs(largeEnsembles);
+
+// Perform batched updates
+while (updates.length > 0) {
+    await table.updateRecordsAsync(updates.splice(0, 50));
+}
