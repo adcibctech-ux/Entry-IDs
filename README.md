@@ -1,10 +1,12 @@
 # Entry-IDs
-### Most up to date working code for Entry IDs to be assigned to scheduled routines.
+# Most up to date working code for Entry IDs to be assigned to scheduled routines.
 <br>
 ## Here are the steps in how to execute this code. 
 <br>
-### Go to company DCG website.
+# Go to company DCG website.
+<br>
 --> Go to "Schedule"
+<br>
 --> Go to "Reports"
 --> Select city you want to assign IDs in
 --> Select "Schedule Data (Excel)". Display fields in this order:
