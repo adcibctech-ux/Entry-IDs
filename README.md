@@ -1,26 +1,41 @@
 # Entry-IDs
 # Most up to date working code for Entry IDs to be assigned to scheduled routines.
 <br>
-## Here are the steps in how to execute this code. 
+**Here are the steps in how to execute this code.** 
 <br>
-# Go to company DCG website.
+(1) Go to company DCG website.
 <br>
---> Go to "Schedule"
+      --> Go to "Schedule"
 <br>
---> Go to "Reports"
---> Select city you want to assign IDs in
---> Select "Schedule Data (Excel)". Display fields in this order:
-      1) Entry ID
-      2) Participants
-      3) Routine Title 
-      4) Number of Dancers 
-      5) Age Category
-      6) Category
-      7) Age
-      8) Studio Name
-      9) Teacher 
-      10) Choreographers
-      11) Registration Email 
-      12) Date of Birth
-***It should already be set to these settings so just click "Export as Excel"
+      --> Go to "Reports"
+<br>
+      --> Select city you want to assign IDs in
+<br>
+      --> Select "Schedule Data (Excel)". Display fields in this order:
+            <br>
+            1) Entry ID
+            <br>
+            2) Participants
+            <br>
+            3) Routine Title 
+            <br>
+            4) Number of Dancers 
+             <br>     
+            5) Age Category
+            <br>
+            6) Category
+            <br>
+            7) Age
+            <br>
+            8) Studio Name
+            <br>
+            9) Teacher 
+            <br>
+            10) Choreographers
+            <br>
+            11) Registration Email 
+            <br>
+            12) Date of Birth
+<br>
+**_It should already be set to these settings so just click "Export as Excel"_**
 
