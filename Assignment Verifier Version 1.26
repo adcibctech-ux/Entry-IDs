@@ -1,0 +1,338 @@
+// Airtable verification script for EntryID assignment with 5-number gaps
+// Also prints which participants sit at the min/max base of each bucket.
+
+let table = base.getTable("San Fran 26"); // <-- change if needed
+let query = await table.selectRecordsAsync({
+  fields: ["Participant", "RoutineType", "Sex", "AgeDivision", "EntryID", "DCG ID"]
+});
+
+// ----- helpers -----
+const isPasTrio = (t) => t === "Pas/Duo/Trio";
+const isEnsemble = (t) => t === "Ensemble";
+const countParticipants = (p) => (p || "").split(",").map(s => s.trim()).filter(Boolean).length;
+
+function parseEntryId(s) {
+  if (!s) return null;
+  const m = String(s).trim().match(/^(\d+)(?:\.(\d+))?((?:xc)|c)?$/i);
+  if (!m) return null;
+  return {
+    base: Number(m[1]),
+    ord: m[2] ? Number(m[2]) : null,       // null => no ".N"
+    tag: m[3] ? m[3].toLowerCase() : ""    // "", "c", or "xc"
+  };
+}
+
+function nOrInf(v, inf = Number.POSITIVE_INFINITY) {
+  if (typeof v === "number") return v;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : inf;
+}
+
+function contiguousCheck(basesArr) {
+  if (!basesArr.length) return true;
+  const sorted = [...new Set(basesArr)].sort((a,b)=>a-b);
+  const minB = sorted[0], maxB = sorted[sorted.length-1];
+  return (maxB - minB + 1 === sorted.length);
+}
+
+function minMaxFromSet(s) {
+  if (!s || s.size === 0) return {min: null, max: null};
+  const arr = [...s].sort((a,b)=>a-b);
+  return {min: arr[0], max: arr[arr.length-1]};
+}
+
+// ----- collect / classify -----
+const issues = [];
+
+const allRecords = query.records.filter(r => r.getCellValue("EntryID")); // only those with IDs
+const entryIdStrings = new Set();
+
+const solos = [];        // solo records (Classical/Contemporary)
+const pasRecords = [];   // Pas/Duo/Trio
+const ensRecords = [];   // Ensembles
+
+for (const r of allRecords) {
+  const eid = r.getCellValue("EntryID");
+  if (entryIdStrings.has(eid)) issues.push(`Duplicate EntryID string found: ${eid}`);
+  entryIdStrings.add(eid);
+
+  const rt = r.getCellValue("RoutineType");
+  const pCount = countParticipants(r.getCellValue("Participant") || "");
+  if (isPasTrio(rt)) pasRecords.push(r);
+  else if (isEnsemble(rt)) ensRecords.push(r);
+  else if (pCount === 1) solos.push(r);
+}
+
+// ----- solos grouped by participant -----
+const byParticipant = new Map();
+for (const r of solos) {
+  const name = (r.getCellValue("Participant") || "").trim();
+  if (!byParticipant.has(name)) byParticipant.set(name, []);
+  byParticipant.get(name).push(r);
+}
+
+// For solo bucket accounting, we need one base per participant per division.
+const participantBaseInt = new Map(); // participant -> base (solo)
+const participantDivisions = new Map(); // participant -> Set(divisions seen)
+const soloBaseByDivision = {
+  Primary: new Set(),
+  Junior: new Set(),
+  Senior: new Set()
+};
+// For edge printing: base -> participants per division
+const soloBaseToParticipantsByDivision = {
+  Primary: new Map(),  // base -> Set(participants)
+  Junior: new Map(),
+  Senior: new Map()
+};
+function addSoloEdge(div, base, participant) {
+  if (!soloBaseToParticipantsByDivision[div].has(base)) {
+    soloBaseToParticipantsByDivision[div].set(base, new Set());
+  }
+  soloBaseToParticipantsByDivision[div].get(base).add(participant);
+}
+
+// Per-participant deep checks (tags, suffixes, DCG order, base consistency)
+for (const [participant, records] of byParticipant.entries()) {
+  const parsed = [];
+  const divisionsSeen = new Set();
+
+  for (const r of records) {
+    const eid = r.getCellValue("EntryID");
+    const pi = parseEntryId(eid);
+    if (!pi) {
+      issues.push(`Invalid EntryID format on solo: "${eid}" (record ${r.id})`);
+      continue;
+    }
+    parsed.push({
+      r, eid, pi,
+      type: r.getCellValue("RoutineType"),
+      dcg: nOrInf(r.getCellValue("DCG ID")),
+      div: r.getCellValue("AgeDivision") || "N/A",
+      sex: r.getCellValue("Sex") || "N/A"
+    });
+    divisionsSeen.add(r.getCellValue("AgeDivision") || "N/A");
+  }
+
+  if (!parsed.length) continue;
+
+  // base integer must be consistent for the participant
+  const baseSet = new Set(parsed.map(x => x.pi.base));
+  if (baseSet.size !== 1) {
+    issues.push(`Participant "${participant}" has multiple base integers: ${[...baseSet].join(", ")}`);
+  }
+  const base = parsed[0].pi.base;
+  participantBaseInt.set(participant, base);
+  participantDivisions.set(participant, divisionsSeen);
+
+  // If participant appears in multiple divisions, flag
+  if (divisionsSeen.size > 1) {
+    issues.push(`Participant "${participant}" appears in multiple divisions: ${[...divisionsSeen].join(", ")}`);
+  }
+
+  // Attribute this participant to its division(s) for bucket contiguity/gap checks & edge print
+  for (const div of divisionsSeen) {
+    if (soloBaseByDivision[div]) {
+      soloBaseByDivision[div].add(base);
+      addSoloEdge(div, base, participant);
+    }
+  }
+
+  // Suffix/tag checks by type with DCG ordering
+  const classical = parsed.filter(x => x.type === "Classical").sort((a,b)=>a.dcg - b.dcg);
+  const contemporary = parsed.filter(x => x.type === "Contemporary").sort((a,b)=>a.dcg - b.dcg);
+
+  // CLASSICAL: tag must be "", suffix "", ".2", ".3", ...
+  classical.forEach((x, i) => {
+    if (x.pi.tag !== "") {
+      issues.push(`Classical routine has tag "${x.pi.tag}" (should be none): ${participant}, EntryID ${x.eid}`);
+    }
+    const expectedOrd = (i === 0) ? null : (i + 1);
+    if ((expectedOrd === null && x.pi.ord !== null) ||
+        (expectedOrd !== null && x.pi.ord !== expectedOrd)) {
+      issues.push(`Classical suffix mismatch for ${participant}: expected ${i===0?'no suffix':'.'+expectedOrd}, got "${x.eid}" (DCG ${x.dcg})`);
+    }
+  });
+
+  // CONTEMPORARY: tag "c" if any Classical exists; else "xc". Suffix increments by DCG order.
+  const expectTag = classical.length > 0 ? "c" : "xc";
+  if (contemporary.length > 0) {
+    const tagsUsed = new Set(contemporary.map(x => x.pi.tag));
+    if (tagsUsed.size !== 1 || !tagsUsed.has(expectTag)) {
+      issues.push(`Contemporary tag inconsistency for ${participant}: expected "${expectTag}" only, saw [${[...tagsUsed].join(", ")}]`);
+    }
+    contemporary.forEach((x, i) => {
+      if (x.pi.tag !== expectTag) {
+        issues.push(`Contemporary tag mismatch for ${participant}: expected "${expectTag}", got "${x.pi.tag}" in ${x.eid}`);
+      }
+      const expectedOrd = (i === 0) ? null : (i + 1);
+      if ((expectedOrd === null && x.pi.ord !== null) ||
+          (expectedOrd !== null && x.pi.ord !== expectedOrd)) {
+        issues.push(`Contemporary suffix mismatch for ${participant}: expected ${i===0?expectTag:'.'+expectedOrd+expectTag}, got "${x.eid}" (DCG ${x.dcg})`);
+      }
+    });
+  }
+}
+
+// ----- sex order per solo division: female before male -----
+const divisions = ["Primary","Junior","Senior"];
+for (const div of divisions) {
+  const femaleBases = [];
+  const maleBases = [];
+  for (const [p, records] of byParticipant.entries()) {
+    const inDiv = records.filter(r => r.getCellValue("AgeDivision") === div);
+    if (inDiv.length === 0) continue;
+    const base = participantBaseInt.get(p);
+    const sex = (inDiv[0].getCellValue("Sex") || "N/A");
+    if (sex === "Female") femaleBases.push(base);
+    else if (sex === "Male") maleBases.push(base);
+  }
+  if (femaleBases.length && maleBases.length) {
+    const maxF = Math.max(...femaleBases);
+    const minM = Math.min(...maleBases);
+    if (!(minM > maxF)) {
+      issues.push(`Sex order violation in ${div}: min male base (${minM}) is not > max female base (${maxF}).`);
+    }
+  }
+}
+
+// ----- bucket building -----
+const bucketBases = {
+  Primary: soloBaseByDivision.Primary,
+  Junior: soloBaseByDivision.Junior,
+  Senior: soloBaseByDivision.Senior,
+  Pas: new Set(),
+  Ensemble: new Set()
+};
+
+// For edge printing on Pas/Ensemble: base -> participants string(s)
+const pasBaseToParticipants = new Map();
+const ensBaseToParticipants = new Map();
+
+function addNameToMap(map, base, name) {
+  if (!map.has(base)) map.set(base, new Set());
+  map.get(base).add(name);
+}
+
+// Pas/Duo/Trio base collection + checks (no suffix/tag)
+for (const r of pasRecords) {
+  const pi = parseEntryId(r.getCellValue("EntryID"));
+  if (!pi) {
+    issues.push(`Invalid EntryID on Pas/Duo/Trio: "${r.getCellValue("EntryID")}" (record ${r.id})`);
+    continue;
+  }
+  if (pi.ord !== null || (pi.tag && pi.tag !== "")) {
+    issues.push(`Pas/Duo/Trio should not have suffix or tag: ${r.getCellValue("EntryID")} (record ${r.id})`);
+  }
+  bucketBases.Pas.add(pi.base);
+  addNameToMap(pasBaseToParticipants, pi.base, r.getCellValue("Participant") || "(no participant)");
+}
+
+// Ensemble base collection + checks (no suffix/tag)
+for (const r of ensRecords) {
+  const pi = parseEntryId(r.getCellValue("EntryID"));
+  if (!pi) {
+    issues.push(`Invalid EntryID on Ensemble: "${r.getCellValue("EntryID")}" (record ${r.id})`);
+    continue;
+  }
+  if (pi.ord !== null || (pi.tag && pi.tag !== "")) {
+    issues.push(`Ensemble should not have suffix or tag: ${r.getCellValue("EntryID")} (record ${r.id})`);
+  }
+  bucketBases.Ensemble.add(pi.base);
+  addNameToMap(ensBaseToParticipants, pi.base, r.getCellValue("Participant") || "(no participant)");
+}
+
+// Build global base -> buckets map for gap checks (helps detect any gap pollution)
+const baseToBuckets = new Map(); // base -> Set(bucketNames)
+for (const [bucket, set] of Object.entries(bucketBases)) {
+  for (const b of set) {
+    if (!baseToBuckets.has(b)) baseToBuckets.set(b, new Set());
+    baseToBuckets.get(b).add(bucket);
+  }
+}
+
+// ----- contiguity inside each bucket -----
+for (const [bucket, set] of Object.entries(bucketBases)) {
+  const arr = [...set];
+  if (!contiguousCheck(arr)) {
+    const sorted = [...new Set(arr)].sort((a,b)=>a-b);
+    const minB = sorted[0], maxB = sorted[sorted.length-1];
+    issues.push(`Non-contiguous bases within ${bucket}. min=${minB}, max=${maxB}, uniqueCount=${sorted.length}, expected=${maxB - minB + 1}`);
+  }
+}
+
+// ----- verify exact 5-number gaps between buckets -----
+const bucketOrder = ["Primary","Junior","Senior","Pas","Ensemble"];
+const presentBuckets = bucketOrder.filter(b => bucketBases[b] && bucketBases[b].size > 0);
+
+for (let i = 0; i < presentBuckets.length - 1; i++) {
+  const prev = presentBuckets[i];
+  const next = presentBuckets[i+1];
+  const {max: prevMax} = minMaxFromSet(bucketBases[prev]);
+  const {min: nextMin} = minMaxFromSet(bucketBases[next]);
+  if (prevMax !== null && nextMin !== null) {
+    const expectedNextMin = prevMax + 6; // skip 5 integers
+    if (nextMin !== expectedNextMin) {
+      issues.push(
+        `Gap error between ${prev} → ${next}: expected next min base ${expectedNextMin} (5-number gap), got ${nextMin}.`
+      );
+    }
+    // Ensure gap numbers are unused anywhere
+    for (let g = prevMax + 1; g <= prevMax + 5; g++) {
+      if (baseToBuckets.has(g)) {
+        issues.push(`Gap violation: base ${g} (should be empty between ${prev} and ${next}) is used in bucket(s): ${[...baseToBuckets.get(g)].join(", ")}`);
+      }
+    }
+  }
+}
+
+// ----- report -----
+function namesForSoloBase(div, base) {
+  const m = soloBaseToParticipantsByDivision[div];
+  if (!m || !m.has(base)) return [];
+  return [...m.get(base)];
+}
+function namesForPasBase(base) {
+  return pasBaseToParticipants.has(base) ? [...pasBaseToParticipants.get(base)] : [];
+}
+function namesForEnsBase(base) {
+  return ensBaseToParticipants.has(base) ? [...ensBaseToParticipants.get(base)] : [];
+}
+
+console.log("=== ENTRYID VERIFICATION SUMMARY (with 5-number gaps) ===");
+console.log(`Total records verified: ${allRecords.length}`);
+console.log(`Unique EntryID strings: ${entryIdStrings.size}`);
+
+for (const b of bucketOrder) {
+  const set = bucketBases[b];
+  const {min, max} = minMaxFromSet(set);
+  const count = set.size;
+  if (!count) {
+    console.log(`${b}: count=0`);
+    continue;
+  }
+
+  let minNames = [], maxNames = [];
+  if (b === "Primary" || b === "Junior" || b === "Senior") {
+    minNames = namesForSoloBase(b, min);
+    maxNames = namesForSoloBase(b, max);
+  } else if (b === "Pas") {
+    minNames = namesForPasBase(min);
+    maxNames = namesForPasBase(max);
+  } else if (b === "Ensemble") {
+    minNames = namesForEnsBase(min);
+    maxNames = namesForEnsBase(max);
+  }
+
+  console.log(`${b}: count=${count} (min=${min}, max=${max})`);
+  console.log(`  ↳ min edge participants: ${minNames.length ? minNames.join(" | ") : "(none found)"}`);
+  console.log(`  ↳ max edge participants: ${maxNames.length ? maxNames.join(" | ") : "(none found)"}`);
+}
+
+console.log(`Issues found: ${issues.length}`);
+if (issues.length) {
+  console.log("---- Issues ----");
+  issues.forEach((msg, i) => console.log(`${i+1}. ${msg}`));
+} else {
+  console.log("All checks passed ✅");
+}
